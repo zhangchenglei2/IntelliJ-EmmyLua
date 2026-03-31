@@ -22,7 +22,7 @@ import java.io.ByteArrayOutputStream
 
 plugins {
     id("org.jetbrains.intellij.platform") version "2.7.0"
-    id("org.jetbrains.kotlin.jvm").version("2.1.0")
+    id("org.jetbrains.kotlin.jvm").version("2.3.0")
     id("de.undercouch.download").version("5.3.0")
 }
 
