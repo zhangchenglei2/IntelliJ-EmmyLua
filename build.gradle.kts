@@ -50,12 +50,24 @@ val buildDataList = listOf(
         bunch = "212",
         targetCompatibilityLevel = JavaVersion.VERSION_21,
         jvmTarget = "21"
+    ),
+    BuildData(
+        ideaSDKShortVersion = "2026.1",
+        ideaSDKVersion = "261.22158.335",
+        sinceBuild = "261",
+        untilBuild = "261.*",
+        bunch = "212",
+        targetCompatibilityLevel = JavaVersion.VERSION_21,
+        jvmTarget = "21"
     )
 )
 
 val buildVersion = System.getProperty("IDEA_VER") ?: buildDataList.first().ideaSDKShortVersion
 
-val buildVersionData = buildDataList.find { it.ideaSDKShortVersion == buildVersion }!!
+val buildVersionData = buildDataList.find {
+    it.ideaSDKShortVersion == buildVersion ||
+    it.ideaSDKVersion.startsWith(buildVersion)
+} ?: error("未找到匹配的构建版本: $buildVersion，可用版本: ${buildDataList.map { it.ideaSDKShortVersion }}")
 
 val emmyDebuggerVersion = "1.3.0"
 
@@ -164,7 +176,11 @@ project(":") {
         implementation("org.eclipse.mylyn.github:org.eclipse.egit.github.core:2.1.5")
         implementation("com.jgoodies:forms:1.2.1")
         intellijPlatform {
-            intellijIdeaUltimate(buildVersionData.ideaSDKVersion)
+            if (buildVersionData.ideaSDKShortVersion == "2026.1") {
+                local("C:/Program Files/JetBrains/JetBrains Rider 2025.2.3")
+            } else {
+                intellijIdeaUltimate(buildVersionData.ideaSDKVersion)
+            }
             bundledModule("intellij.spellchecker")
         }
     }
