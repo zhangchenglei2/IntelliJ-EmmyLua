@@ -206,15 +206,18 @@ project(":") {
     task("bunch") {
         doLast {
             val rev = getRev()
-            // reset
-            exec {
-                executable = "git"
-                args("reset", "HEAD", "--hard")
-            }
-            // clean untracked files
-            exec {
-                executable = "git"
-                args("clean", "-d", "-f")
+            if (isCI) {
+                // CI 环境下才重置，避免本地未提交的修改被丢弃
+                // reset
+                exec {
+                    executable = "git"
+                    args("reset", "HEAD", "--hard")
+                }
+                // clean untracked files
+                exec {
+                    executable = "git"
+                    args("clean", "-d", "-f")
+                }
             }
             // switch
             exec {
