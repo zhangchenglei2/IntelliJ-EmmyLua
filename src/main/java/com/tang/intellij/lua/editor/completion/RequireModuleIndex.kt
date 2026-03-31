@@ -18,6 +18,9 @@ package com.tang.intellij.lua.editor.completion
 
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.progress.ProgressIndicator
+import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.guessProjectDir
 import com.intellij.openapi.vfs.VirtualFile
@@ -31,12 +34,15 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import com.tang.intellij.lua.project.LuaSettings
 import com.tang.intellij.lua.project.LuaSourceRootManager
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.regex.Pattern
 
 /**
  * 项目级别的 require 模块索引服务。
  *
- * 扫描所有源码根目录下的 .lua 文件，提取 require 语句，
+ * 遍历所有源码根目录下的 .lua 文件，提取其中的 require 语句：
+ *   local UIConfig = require("Game.Mod.BaseMod.Client.Config.UIConfig")
+ * 以变量名（UIConfig）为 key，require 路径（Game.Mod.BaseMod.Client.Config.UIConfig）为 value，
  * 建立 varName -> List<RequireModuleInfo> 的映射。
  *
  * 支持增量更新：通过 VFS 监听文件变化，仅重新解析变更的文件。
@@ -58,7 +64,7 @@ class RequireModuleIndex(private val project: Project) {
          *   local VarName = require 'path.to.module'
          */
         private val REQUIRE_PATTERN: Pattern = Pattern.compile(
-            """local\s+(\w+)\s*=\s*require\s*[\("']([^"')]+)["')]?"""
+            """local\s+(\w+)\s*=\s*require\s*\(?\s*["']([^"']+)["']\s*\)?"""
         )
 
         private fun isLuaFile(file: VirtualFile): Boolean {
@@ -69,8 +75,11 @@ class RequireModuleIndex(private val project: Project) {
     // varName -> List<RequireModuleInfo>，线程安全
     private val indexMap = ConcurrentHashMap<String, MutableList<RequireModuleInfo>>()
 
-    @Volatile
-    private var isBuilt = false
+    /** 索引是否已构建完成 */
+    private val isBuilt = AtomicBoolean(false)
+
+    /** 是否正在构建中（防止重复触发） */
+    private val isBuilding = AtomicBoolean(false)
 
     init {
         // 监听文件变化，实现增量更新索引
@@ -101,18 +110,86 @@ class RequireModuleIndex(private val project: Project) {
     }
 
     /**
+     * 在后台任务中预热索引，显示进度条。
+     * 由 StartupActivity 在项目打开后调用。
+     */
+    fun warmUp() {
+        if (isBuilt.get() || isBuilding.get()) return
+        ProgressManager.getInstance().run(object : Task.Backgroundable(
+            project,
+            "EmmyLua: 正在建立 require 模块索引…",
+            false  // 不可取消，确保索引完整
+        ) {
+            override fun run(indicator: ProgressIndicator) {
+                if (!isBuilding.compareAndSet(false, true)) return
+                try {
+                    indicator.isIndeterminate = false
+                    indicator.fraction = 0.0
+                    indicator.text = "正在收集 Lua 源码根目录…"
+
+                    val sourceRoots = collectSourceRoots()
+                    if (sourceRoots.isEmpty()) {
+                        LOG.warn("RequireModuleIndex: no source roots found, index will be empty")
+                        isBuilt.set(true)
+                        return
+                    }
+
+                    // 先收集所有 lua 文件，再逐个解析，以便显示准确进度
+                    indicator.text = "正在扫描 .lua 文件…"
+                    indicator.fraction = 0.1
+                    val allLuaFiles = mutableListOf<VirtualFile>()
+                    for (root in sourceRoots) {
+                        collectLuaFiles(root, allLuaFiles)
+                    }
+
+                    val total = allLuaFiles.size
+                    LOG.warn("RequireModuleIndex: found $total lua files in roots=${sourceRoots.map { it.path }}, files=${allLuaFiles.map { it.path }}")
+
+                    indicator.text = "正在解析 require 语句（共 $total 个文件）…"
+                    allLuaFiles.forEachIndexed { idx, file ->
+                        indicator.fraction = 0.1 + 0.9 * (idx.toDouble() / total)
+                        indicator.text2 = file.name
+                        parseAndIndex(file)
+                    }
+
+                    isBuilt.set(true)
+                    LOG.info("RequireModuleIndex: built, total varNames=${indexMap.size}")
+                    // 打印完整 map，方便诊断索引内容
+                    val mapDump = indexMap.entries.joinToString(separator = "\n") { (k, v) ->
+                        "  $k -> ${v.map { it.requirePath }}"
+                    }
+                    LOG.warn("RequireModuleIndex: full indexMap dump:\n$mapDump")
+                } finally {
+                    isBuilding.set(false)
+                }
+            }
+
+            override fun onSuccess() {
+                LOG.info("RequireModuleIndex: warm-up finished, varNames=${indexMap.size}")
+            }
+        })
+    }
+
+    /**
+     * 索引是否已就绪
+     */
+    fun isReady(): Boolean = isBuilt.get()
+
+    /**
      * 根据变量名查询所有匹配的模块信息（精确匹配）
+     * 若索引尚未就绪，返回空列表（不阻塞）
      */
     fun getModulesByName(varName: String): List<RequireModuleInfo> {
-        ensureBuilt()
+        if (!isBuilt.get()) return emptyList()
         return indexMap[varName]?.toList() ?: emptyList()
     }
 
     /**
      * 获取所有已索引的变量名集合（用于前缀匹配）
+     * 若索引尚未就绪，返回空集合（不阻塞）
      */
     fun getAllVarNames(): Set<String> {
-        ensureBuilt()
+        if (!isBuilt.get()) return emptySet()
         return indexMap.keys.toSet()
     }
 
@@ -121,44 +198,51 @@ class RequireModuleIndex(private val project: Project) {
      */
     fun rebuildIndex() {
         indexMap.clear()
-        isBuilt = false
-        buildIndex()
-        isBuilt = true
+        isBuilt.set(false)
+        warmUp()
     }
 
     // -------------------------------------------------------------------------
     // 私有实现
     // -------------------------------------------------------------------------
 
+    /** 已废弃：改用 warmUp() 异步构建，此方法保留供内部兼容 */
     private fun ensureBuilt() {
-        if (!isBuilt) {
-            synchronized(this) {
-                if (!isBuilt) {
-                    buildIndex()
-                    isBuilt = true
-                }
-            }
+        if (!isBuilt.get() && !isBuilding.get()) {
+            warmUp()
         }
     }
 
-    private fun buildIndex() {
+    private fun collectSourceRoots(): Set<VirtualFile> {
         val sourceRoots = mutableSetOf<VirtualFile>()
+        val lfs = LocalFileSystem.getInstance()
 
         // 1. 用户在 Settings > EmmyLua 中配置的 Additional Sources Root
-        val lfs = LocalFileSystem.getInstance()
         for (path in LuaSettings.instance.additionalSourcesRoot) {
             if (path.isBlank()) continue
             val vf = lfs.findFileByPath(path)
             if (vf != null && vf.isDirectory) sourceRoots.add(vf)
         }
 
-        // 2. 在 Project Structure 中配置的 Source Root
+        // 2. 在 Project Structure 中配置的 Source Root（包括 Test Source Root）
         sourceRoots.addAll(LuaSourceRootManager.getInstance(project).getSourceRoots())
 
-        // 3. 兜底：项目根目录（确保没有任何配置时也能工作）
-        val baseDir = project.guessProjectDir()
-        if (baseDir != null) sourceRoots.add(baseDir)
+        LOG.info("RequireModuleIndex: collectSourceRoots => ${sourceRoots.map { it.path }}")
+        return sourceRoots
+    }
 
+    private fun collectLuaFiles(dir: VirtualFile, result: MutableList<VirtualFile>) {
+        if (!dir.isValid) return
+        for (child in dir.children) {
+            when {
+                child.isDirectory -> collectLuaFiles(child, result)
+                isLuaFile(child) -> result.add(child)
+            }
+        }
+    }
+
+    private fun buildIndex() {
+        val sourceRoots = collectSourceRoots()
         LOG.info("RequireModuleIndex: building index, roots=${sourceRoots.map { it.path }}")
         for (root in sourceRoots) {
             scanDirectory(root)
@@ -189,28 +273,38 @@ class RequireModuleIndex(private val project: Project) {
     }
 
     /**
-     * 解析单个 .lua 文件，提取 require 语句并写入索引
+     * 解析单个 .lua 文件，提取所有 require 语句并写入索引。
+     *
+     * 例如：local UIConfig = require("Game.Mod.BaseMod.Client.Config.UIConfig")
+     *  -> varName = "UIConfig", requirePath = "Game.Mod.BaseMod.Client.Config.UIConfig"
      */
     private fun parseAndIndex(file: VirtualFile) {
         if (!file.isValid || file.isDirectory) return
         try {
             val content = String(file.contentsToByteArray(), Charsets.UTF_8)
             val matcher = REQUIRE_PATTERN.matcher(content)
+            val foundVarNames = mutableListOf<String>()
             while (matcher.find()) {
                 val varName = matcher.group(1) ?: continue
                 val requirePath = matcher.group(2) ?: continue
                 if (varName.isBlank() || requirePath.isBlank()) continue
 
+                foundVarNames.add(varName)
                 val info = RequireModuleInfo(varName, requirePath.trim(), file)
                 indexMap.getOrPut(varName) { mutableListOf() }.let { list ->
-                    // 避免重复添加同一文件的同一条目
-                    if (list.none { it.sourceFile == file && it.requirePath == requirePath }) {
+                    // 相同 varName + 相同 requirePath 视为重复，不管来自哪个文件，只保留一条
+                    if (list.none { it.requirePath == requirePath }) {
                         list.add(info)
                     }
                 }
             }
-        } catch (_: Exception) {
-            // 忽略无法读取的文件（如二进制文件、权限问题等）
+            if (foundVarNames.isNotEmpty()) {
+                LOG.warn("RequireModuleIndex: parsed ${file.path}, found varNames=$foundVarNames")
+            } else {
+                LOG.warn("RequireModuleIndex: parsed ${file.path}, no require statements found")
+            }
+        } catch (e: Exception) {
+            LOG.warn("RequireModuleIndex: failed to parse ${file.path}: ${e.message}")
         }
     }
 }

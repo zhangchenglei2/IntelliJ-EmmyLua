@@ -152,6 +152,7 @@
         <!--lua settings-->
         <applicationService serviceImplementation="com.tang.intellij.lua.project.LuaSettings"/>
         <projectService serviceImplementation="com.tang.intellij.lua.editor.completion.RequireModuleIndex"/>
+        <postStartupActivity implementation="com.tang.intellij.lua.editor.completion.RequireModuleIndexStartupActivity"/>
         <applicationConfigurable groupId="language"
                                  displayName="EmmyLua"
                                  id="preferences.Lua"

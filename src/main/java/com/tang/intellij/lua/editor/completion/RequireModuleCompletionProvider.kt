@@ -22,10 +22,10 @@ import com.intellij.codeInsight.completion.PrioritizedLookupElement
 import com.intellij.codeInsight.lookup.LookupElement
 import com.intellij.codeInsight.lookup.LookupElementBuilder
 import com.intellij.openapi.command.WriteCommandAction
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.editor.Document
 import com.tang.intellij.lua.lang.LuaIcons
 import com.tang.intellij.lua.project.LuaSettings
-import com.tang.intellij.lua.psi.LuaDeclarationTree
 import com.tang.intellij.lua.psi.LuaPsiFile
 
 /**
@@ -42,6 +42,10 @@ import com.tang.intellij.lua.psi.LuaPsiFile
  */
 class RequireModuleCompletionProvider : LuaCompletionProvider() {
 
+    companion object {
+        private val LOG = Logger.getInstance(RequireModuleCompletionProvider::class.java)
+    }
+
     override fun addCompletions(session: CompletionSession) {
         val parameters = session.parameters
         val resultSet = session.resultSet
@@ -50,23 +54,56 @@ class RequireModuleCompletionProvider : LuaCompletionProvider() {
 
         // 至少输入 2 个字符才触发，避免过早弹出大量候选
         val prefix = resultSet.prefixMatcher.prefix
-        if (prefix.length < 2) return
+        LOG.warn("[RequireModuleCompletion] triggered, prefix='$prefix', file=${file.name}")
+        if (prefix.length < 2) {
+            LOG.warn("[RequireModuleCompletion] prefix too short (<2), skip")
+            return
+        }
+
+        // 过滤 Lua 关键字，避免在输入 local/end/if 等关键字时触发
+        val LUA_KEYWORDS = setOf(
+            "and", "break", "do", "else", "elseif", "end", "false", "for",
+            "function", "goto", "if", "in", "local", "nil", "not", "or",
+            "repeat", "return", "then", "true", "until", "while"
+        )
+        if (prefix in LUA_KEYWORDS) {
+            LOG.warn("[RequireModuleCompletion] prefix is a Lua keyword, skip")
+            return
+        }
 
         val index = RequireModuleIndex.getInstance(file.project)
 
-        for (varName in index.getAllVarNames()) {
+        // 索引尚未就绪（后台任务还在构建中），静默跳过
+        if (!index.isReady()) {
+            LOG.warn("[RequireModuleCompletion] index not ready yet (still building), skip")
+            return
+        }
+
+        val allVarNames = index.getAllVarNames()
+        LOG.warn("[RequireModuleCompletion] index size=${allVarNames.size}, prefix='$prefix'")
+        if (allVarNames.isEmpty()) {
+            LOG.warn("[RequireModuleCompletion] index is EMPTY! Check if source roots are configured correctly.")
+        } else {
+            // 打印所有 varName，帮助诊断索引内容
+            val matched = allVarNames.filter { it.startsWith(prefix, ignoreCase = true) }
+            LOG.warn("[RequireModuleCompletion] varNames matching prefix: $matched")
+            LOG.warn("[RequireModuleCompletion] all varNames: ${allVarNames.sorted()}")
+        }
+
+        for (varName in allVarNames) {
             // 前缀不匹配则跳过
             if (!resultSet.prefixMatcher.prefixMatches(varName)) continue
 
-            // 如果该变量名已在当前作用域中定义（local 或 global），则跳过
-            if (isDefinedInCurrentScope(varName, position)) continue
-
-            // 如果当前文件已经有该变量名的 require 语句，则跳过
-            if (isAlreadyRequired(varName, file)) continue
+            // 如果当前文件已经有该变量名的 require 语句（不管路径），则跳过
+            if (isAlreadyRequired(varName, file)) {
+                LOG.warn("[RequireModuleCompletion] '$varName' skipped: already required in file")
+                continue
+            }
 
             val modules = index.getModulesByName(varName)
             if (modules.isEmpty()) continue
 
+            LOG.warn("[RequireModuleCompletion] adding candidate: '$varName'")
             for (info in modules) {
                 val element = buildLookupElement(info)
                 // 优先级 80：高于普通单词补全（-1），低于本地变量补全（默认 0）
@@ -76,24 +113,8 @@ class RequireModuleCompletionProvider : LuaCompletionProvider() {
     }
 
     /**
-     * 检查变量名是否已在当前作用域中以 local 形式定义。
-     * 只检查 local 变量，全局变量不算（全局变量正是我们要补全的目标）。
-     */
-    private fun isDefinedInCurrentScope(varName: String, position: com.intellij.psi.PsiElement): Boolean {
-        var found = false
-        LuaDeclarationTree.get(position.containingFile).walkUpLocal(position) { declaration ->
-            if (declaration.name == varName) {
-                found = true
-                false  // 停止遍历
-            } else {
-                true   // 继续遍历
-            }
-        }
-        return found
-    }
-
-    /**
-     * 检查当前文件是否已经存在对应变量名的 require 语句
+     * 检查当前文件是否已经存在该变量名的 require 语句。
+     * 只要变量名相同（不管路径），就认为已经 require 过，不再提示。
      */
     private fun isAlreadyRequired(varName: String, file: LuaPsiFile): Boolean {
         val text = file.text ?: return false
@@ -109,8 +130,10 @@ class RequireModuleCompletionProvider : LuaCompletionProvider() {
      *  - tailText 提示 "(auto require)"，告知用户会自动插入 require 语句
      */
     private fun buildLookupElement(info: RequireModuleInfo): LookupElement {
+        // 用 info 对象作为 lookup object（而非 varName 字符串），
+        // 避免同一 varName 不同路径的候选项被 IntelliJ 框架按 lookupString 去重
         return LookupElementBuilder
-            .create(info.varName)
+            .create(info, info.varName)
             .withIcon(LuaIcons.MODULE)
             .withTypeText(info.requirePath, true)
             .withTailText("  (auto require)", true)
@@ -156,45 +179,10 @@ class RequireInsertHandler(private val info: RequireModuleInfo) : InsertHandler<
 
     /**
      * 计算 require 语句的插入位置（字符偏移量）
+     *
+     * 插入位置策略：始终插入到文件第一行（offset=0），确保新增的 require 始终在文件最顶部。
      */
     private fun findInsertOffset(text: String): Int {
-        if (text.isEmpty()) return 0
-
-        val lines = text.split("\n")
-        // 匹配 require 语句行
-        val requireLinePattern = Regex("""^\s*local\s+\w+\s*=\s*require\s*[\("']""")
-        // 匹配空行或纯注释行
-        val blankOrCommentPattern = Regex("""^\s*(--.*)?\s*$""")
-
-        var currentOffset = 0
-        var lastRequireLineEnd = -1
-        var firstCodeLineStart = -1
-
-        for (line in lines) {
-            val lineStart = currentOffset
-            // +1 是换行符 '\n' 的长度（split 会去掉换行符）
-            val lineEnd = currentOffset + line.length + 1
-
-            when {
-                requireLinePattern.containsMatchIn(line) -> {
-                    // 记录最后一个 require 行的结束位置
-                    lastRequireLineEnd = lineEnd
-                }
-                !blankOrCommentPattern.matches(line) && firstCodeLineStart == -1 -> {
-                    // 记录第一个非注释、非空行的起始位置
-                    firstCodeLineStart = lineStart
-                }
-            }
-            currentOffset = lineEnd
-        }
-
-        return when {
-            // 优先：在最后一个 require 语句之后插入
-            lastRequireLineEnd > 0 -> minOf(lastRequireLineEnd, text.length)
-            // 其次：在第一个代码行之前插入
-            firstCodeLineStart > 0 -> firstCodeLineStart
-            // 兜底：文件开头
-            else -> 0
-        }
+        return 0
     }
 }
