@@ -17,7 +17,9 @@
 package com.tang.intellij.lua.editor.completion
 
 import com.intellij.openapi.components.Service
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.project.guessProjectDir
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.openapi.vfs.newvfs.BulkFileListener
@@ -25,7 +27,8 @@ import com.intellij.openapi.vfs.newvfs.events.VFileContentChangeEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileCreateEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileDeleteEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileEvent
-import com.tang.intellij.lua.lang.LuaFileType
+import com.intellij.openapi.vfs.LocalFileSystem
+import com.tang.intellij.lua.project.LuaSettings
 import com.tang.intellij.lua.project.LuaSourceRootManager
 import java.util.concurrent.ConcurrentHashMap
 import java.util.regex.Pattern
@@ -42,6 +45,8 @@ import java.util.regex.Pattern
 class RequireModuleIndex(private val project: Project) {
 
     companion object {
+        private val LOG = Logger.getInstance(RequireModuleIndex::class.java)
+
         fun getInstance(project: Project): RequireModuleIndex =
             project.getService(RequireModuleIndex::class.java)
 
@@ -55,6 +60,10 @@ class RequireModuleIndex(private val project: Project) {
         private val REQUIRE_PATTERN: Pattern = Pattern.compile(
             """local\s+(\w+)\s*=\s*require\s*[\("']([^"')]+)["')]?"""
         )
+
+        private fun isLuaFile(file: VirtualFile): Boolean {
+            return !file.isDirectory && file.extension?.lowercase() == "lua"
+        }
     }
 
     // varName -> List<RequireModuleInfo>，线程安全
@@ -69,7 +78,7 @@ class RequireModuleIndex(private val project: Project) {
             override fun after(events: List<VFileEvent>) {
                 for (event in events) {
                     val file = event.file ?: continue
-                    if (file.fileType != LuaFileType.INSTANCE) continue
+                    if (!isLuaFile(file)) continue
 
                     when (event) {
                         is VFileDeleteEvent -> {
@@ -133,17 +142,36 @@ class RequireModuleIndex(private val project: Project) {
     }
 
     private fun buildIndex() {
-        val sourceRoots = LuaSourceRootManager.getInstance(project).getSourceRoots()
+        val sourceRoots = mutableSetOf<VirtualFile>()
+
+        // 1. 用户在 Settings > EmmyLua 中配置的 Additional Sources Root
+        val lfs = LocalFileSystem.getInstance()
+        for (path in LuaSettings.instance.additionalSourcesRoot) {
+            if (path.isBlank()) continue
+            val vf = lfs.findFileByPath(path)
+            if (vf != null && vf.isDirectory) sourceRoots.add(vf)
+        }
+
+        // 2. 在 Project Structure 中配置的 Source Root
+        sourceRoots.addAll(LuaSourceRootManager.getInstance(project).getSourceRoots())
+
+        // 3. 兜底：项目根目录（确保没有任何配置时也能工作）
+        val baseDir = project.guessProjectDir()
+        if (baseDir != null) sourceRoots.add(baseDir)
+
+        LOG.info("RequireModuleIndex: building index, roots=${sourceRoots.map { it.path }}")
         for (root in sourceRoots) {
             scanDirectory(root)
         }
+        LOG.info("RequireModuleIndex: built, total varNames=${indexMap.size}")
     }
 
     private fun scanDirectory(dir: VirtualFile) {
+        if (!dir.isValid) return
         for (child in dir.children) {
             when {
                 child.isDirectory -> scanDirectory(child)
-                child.fileType == LuaFileType.INSTANCE -> parseAndIndex(child)
+                isLuaFile(child) -> parseAndIndex(child)
             }
         }
     }

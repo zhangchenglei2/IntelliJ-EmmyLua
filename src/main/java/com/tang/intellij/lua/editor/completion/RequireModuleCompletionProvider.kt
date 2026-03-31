@@ -76,11 +76,12 @@ class RequireModuleCompletionProvider : LuaCompletionProvider() {
     }
 
     /**
-     * 检查变量名是否已在当前作用域中定义（local 或 global 均算）
+     * 检查变量名是否已在当前作用域中以 local 形式定义。
+     * 只检查 local 变量，全局变量不算（全局变量正是我们要补全的目标）。
      */
     private fun isDefinedInCurrentScope(varName: String, position: com.intellij.psi.PsiElement): Boolean {
         var found = false
-        LuaDeclarationTree.get(position.containingFile).walkUp(position) { declaration ->
+        LuaDeclarationTree.get(position.containingFile).walkUpLocal(position) { declaration ->
             if (declaration.name == varName) {
                 found = true
                 false  // 停止遍历
