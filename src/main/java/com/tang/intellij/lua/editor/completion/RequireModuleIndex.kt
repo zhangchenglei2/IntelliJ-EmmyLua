@@ -22,7 +22,6 @@ import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.project.guessProjectDir
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.openapi.vfs.newvfs.BulkFileListener
@@ -31,7 +30,6 @@ import com.intellij.openapi.vfs.newvfs.events.VFileCreateEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileDeleteEvent
 import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.intellij.openapi.vfs.LocalFileSystem
-import com.tang.intellij.lua.project.LuaSettings
 import com.tang.intellij.lua.project.LuaSourceRootManager
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -52,6 +50,7 @@ class RequireModuleIndex(private val project: Project) {
 
     companion object {
         private val LOG = Logger.getInstance(RequireModuleIndex::class.java)
+        private const val LOG_PREFIX = "EmmyLuaAutoRequire"
 
         fun getInstance(project: Project): RequireModuleIndex =
             project.getService(RequireModuleIndex::class.java)
@@ -129,7 +128,7 @@ class RequireModuleIndex(private val project: Project) {
 
                     val sourceRoots = collectSourceRoots()
                     if (sourceRoots.isEmpty()) {
-                        LOG.warn("RequireModuleIndex: no source roots found, index will be empty")
+                        LOG.warn("$LOG_PREFIX no source roots found, index will be empty")
                         isBuilt.set(true)
                         return
                     }
@@ -143,7 +142,7 @@ class RequireModuleIndex(private val project: Project) {
                     }
 
                     val total = allLuaFiles.size
-                    LOG.warn("RequireModuleIndex: found $total lua files in roots=${sourceRoots.map { it.path }}, files=${allLuaFiles.map { it.path }}")
+                    LOG.info("$LOG_PREFIX found $total lua files in ${sourceRoots.size} source roots")
 
                     indicator.text = "正在解析 require 语句（共 $total 个文件）…"
                     allLuaFiles.forEachIndexed { idx, file ->
@@ -153,19 +152,14 @@ class RequireModuleIndex(private val project: Project) {
                     }
 
                     isBuilt.set(true)
-                    LOG.info("RequireModuleIndex: built, total varNames=${indexMap.size}")
-                    // 打印完整 map，方便诊断索引内容
-                    val mapDump = indexMap.entries.joinToString(separator = "\n") { (k, v) ->
-                        "  $k -> ${v.map { it.requirePath }}"
-                    }
-                    LOG.warn("RequireModuleIndex: full indexMap dump:\n$mapDump")
+                    LOG.info("$LOG_PREFIX index built, total varNames=${indexMap.size}")
                 } finally {
                     isBuilding.set(false)
                 }
             }
 
             override fun onSuccess() {
-                LOG.info("RequireModuleIndex: warm-up finished, varNames=${indexMap.size}")
+                LOG.info("$LOG_PREFIX warm-up finished, varNames=${indexMap.size}")
             }
         })
     }
@@ -206,28 +200,22 @@ class RequireModuleIndex(private val project: Project) {
     // 私有实现
     // -------------------------------------------------------------------------
 
-    /** 已废弃：改用 warmUp() 异步构建，此方法保留供内部兼容 */
-    private fun ensureBuilt() {
-        if (!isBuilt.get() && !isBuilding.get()) {
-            warmUp()
-        }
-    }
-
     private fun collectSourceRoots(): Set<VirtualFile> {
         val sourceRoots = mutableSetOf<VirtualFile>()
         val lfs = LocalFileSystem.getInstance()
 
-        // 1. 用户在 Settings > EmmyLua 中配置的 Additional Sources Root
-        for (path in LuaSettings.instance.additionalSourcesRoot) {
+        // 1. 用户在 Project Settings > EmmyLua 中配置的 Auto Require 检索路径（项目级）
+        val manager = LuaSourceRootManager.getInstance(project)
+        for (path in manager.getAutoRequireSourceRoots()) {
             if (path.isBlank()) continue
             val vf = lfs.findFileByPath(path)
             if (vf != null && vf.isDirectory) sourceRoots.add(vf)
         }
 
         // 2. 在 Project Structure 中配置的 Source Root（包括 Test Source Root）
-        sourceRoots.addAll(LuaSourceRootManager.getInstance(project).getSourceRoots())
+        sourceRoots.addAll(manager.getSourceRoots())
 
-        LOG.info("RequireModuleIndex: collectSourceRoots => ${sourceRoots.map { it.path }}")
+        LOG.info("$LOG_PREFIX collectSourceRoots => ${sourceRoots.map { it.path }}")
         return sourceRoots
     }
 
@@ -237,25 +225,6 @@ class RequireModuleIndex(private val project: Project) {
             when {
                 child.isDirectory -> collectLuaFiles(child, result)
                 isLuaFile(child) -> result.add(child)
-            }
-        }
-    }
-
-    private fun buildIndex() {
-        val sourceRoots = collectSourceRoots()
-        LOG.info("RequireModuleIndex: building index, roots=${sourceRoots.map { it.path }}")
-        for (root in sourceRoots) {
-            scanDirectory(root)
-        }
-        LOG.info("RequireModuleIndex: built, total varNames=${indexMap.size}")
-    }
-
-    private fun scanDirectory(dir: VirtualFile) {
-        if (!dir.isValid) return
-        for (child in dir.children) {
-            when {
-                child.isDirectory -> scanDirectory(child)
-                isLuaFile(child) -> parseAndIndex(child)
             }
         }
     }

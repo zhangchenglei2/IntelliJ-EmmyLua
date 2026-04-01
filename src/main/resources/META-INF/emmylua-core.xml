@@ -161,6 +161,11 @@
                           displayName="Emmy Completion"
                           id="preferences.Lua.Completion"/>-->
         </applicationConfigurable>
+        <projectConfigurable parentId="preferences.Lua"
+                             displayName="Auto Require 路径"
+                             id="preferences.Lua.Project"
+                             instance="com.tang.intellij.lua.project.LuaProjectSettingsPanel"
+                             nonDefaultProject="false"/>
 
         <!--intentions-->
         <intentionAction>
