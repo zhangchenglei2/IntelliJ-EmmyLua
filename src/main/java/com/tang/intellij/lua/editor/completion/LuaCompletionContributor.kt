@@ -55,9 +55,6 @@ class LuaCompletionContributor : CompletionContributor() {
         //提示全局函数,local变量,local函数
         extend(CompletionType.BASIC, IN_NAME_EXPR, LocalAndGlobalCompletionProvider(LocalAndGlobalCompletionProvider.ALL))
 
-        // 智能 require 模块补全：当变量名未在作用域中定义时，提示从索引中导入
-        extend(CompletionType.BASIC, IN_NAME_EXPR, RequireModuleCompletionProvider())
-
         extend(CompletionType.BASIC, IN_CLASS_METHOD_NAME, LocalAndGlobalCompletionProvider(LocalAndGlobalCompletionProvider.VARS))
 
         extend(CompletionType.BASIC, GOTO, object : CompletionProvider<CompletionParameters>(){

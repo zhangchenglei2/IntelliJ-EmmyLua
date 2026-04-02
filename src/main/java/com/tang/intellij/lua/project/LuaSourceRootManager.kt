@@ -104,21 +104,6 @@ class LuaSourceRootManager(val project: Project) : PersistentStateComponent<LuaS
         return false
     }
 
-    // -------------------------------------------------------------------------
-    // Auto Require 检索路径（项目级配置）
-    // -------------------------------------------------------------------------
-
-    /** 获取 auto require 检索路径列表（绝对路径字符串） */
-    fun getAutoRequireSourceRoots(): Array<String> {
-        return state.autoRequireSourceRoots.toTypedArray()
-    }
-
-    /** 设置 auto require 检索路径列表，并触发索引重建 */
-    fun setAutoRequireSourceRoots(paths: Array<String>) {
-        state.autoRequireSourceRoots = paths.toMutableList()
-        project.scheduleSave()
-    }
-
     override fun getState(): State {
         return state
     }
@@ -129,8 +114,5 @@ class LuaSourceRootManager(val project: Project) : PersistentStateComponent<LuaS
 
     class State {
         var rootList: MutableList<String> = mutableListOf()
-
-        /** auto require 功能专用的检索路径（绝对路径），项目级独立配置 */
-        var autoRequireSourceRoots: MutableList<String> = mutableListOf()
     }
 }
